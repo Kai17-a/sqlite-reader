@@ -1,0 +1,335 @@
+use std::{env, error::Error, io, time::Duration};
+
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
+};
+use rusqlite::{Connection, OpenFlags, types::ValueRef};
+
+const ROW_LIMIT: usize = 1_000;
+
+#[derive(Default)]
+struct TableData {
+    name: String,
+    columns: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
+
+struct App {
+    database_path: String,
+    tables: Vec<String>,
+    table_index: usize,
+    data: TableData,
+    row_state: TableState,
+    status: String,
+}
+
+impl App {
+    fn new(database_path: String, connection: &Connection) -> rusqlite::Result<Self> {
+        let mut app = Self {
+            database_path,
+            tables: Vec::new(),
+            table_index: 0,
+            data: TableData::default(),
+            row_state: TableState::default(),
+            status: String::new(),
+        };
+        app.reload(connection)?;
+        Ok(app)
+    }
+
+    fn reload(&mut self, connection: &Connection) -> rusqlite::Result<()> {
+        let previous = self.tables.get(self.table_index).cloned();
+        self.tables = table_names(connection)?;
+        self.table_index = previous
+            .and_then(|name| self.tables.iter().position(|table| table == &name))
+            .unwrap_or(0);
+        self.load_current_table(connection)?;
+        self.status = format!("reloaded {}", self.database_path);
+        Ok(())
+    }
+
+    fn load_current_table(&mut self, connection: &Connection) -> rusqlite::Result<()> {
+        self.data = match self.tables.get(self.table_index) {
+            Some(name) => load_table(connection, name)?,
+            None => TableData::default(),
+        };
+        self.row_state
+            .select((!self.data.rows.is_empty()).then_some(0));
+        Ok(())
+    }
+
+    fn select_table(&mut self, connection: &Connection, delta: isize) -> rusqlite::Result<()> {
+        if self.tables.is_empty() {
+            return Ok(());
+        }
+        self.table_index = self
+            .table_index
+            .saturating_add_signed(delta)
+            .min(self.tables.len() - 1);
+        self.load_current_table(connection)
+    }
+
+    fn select_row(&mut self, delta: isize) {
+        if self.data.rows.is_empty() {
+            return;
+        }
+        let current = self.row_state.selected().unwrap_or(0);
+        self.row_state.select(Some(
+            current
+                .saturating_add_signed(delta)
+                .min(self.data.rows.len() - 1),
+        ));
+    }
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn table_names(connection: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    statement.query_map([], |row| row.get(0))?.collect()
+}
+
+fn load_table(connection: &Connection, name: &str) -> rusqlite::Result<TableData> {
+    let sql = format!("SELECT * FROM {} LIMIT {ROW_LIMIT}", quote_identifier(name));
+    let mut statement = connection.prepare(&sql)?;
+    let columns = statement
+        .column_names()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let count = statement.column_count();
+    let rows = statement
+        .query_map([], |row| {
+            (0..count)
+                .map(|index| display_value(row.get_ref(index)?))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(TableData {
+        name: name.to_owned(),
+        columns,
+        rows,
+    })
+}
+
+fn display_value(value: ValueRef<'_>) -> rusqlite::Result<String> {
+    Ok(match value {
+        ValueRef::Null => "NULL".to_owned(),
+        ValueRef::Integer(value) => value.to_string(),
+        ValueRef::Real(value) => value.to_string(),
+        ValueRef::Text(value) => String::from_utf8_lossy(value).into_owned(),
+        ValueRef::Blob(value) => format!("<BLOB {} bytes>", value.len()),
+    })
+}
+
+fn draw(frame: &mut ratatui::Frame, app: &mut App) {
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(7),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+    draw_tabs(frame, app, areas[0]);
+    draw_rows(frame, app, areas[1]);
+    draw_detail(frame, app, areas[2]);
+    let help = Line::from(vec![
+        Span::styled("←/→", Style::default().fg(Color::Cyan)),
+        Span::raw(" table  "),
+        Span::styled("↑/↓ PgUp/PgDn", Style::default().fg(Color::Cyan)),
+        Span::raw(" row  "),
+        Span::styled("r", Style::default().fg(Color::Cyan)),
+        Span::raw(" reload  "),
+        Span::styled("q", Style::default().fg(Color::Cyan)),
+        Span::raw(" quit  "),
+        Span::styled(&app.status, Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(help), areas[3]);
+}
+
+fn draw_tabs(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let tabs = if app.tables.is_empty() {
+        Line::from("No user tables")
+    } else {
+        Line::from(
+            app.tables
+                .iter()
+                .enumerate()
+                .flat_map(|(index, name)| {
+                    let style = if index == app.table_index {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    [Span::raw(" "), Span::styled(name, style), Span::raw(" ")]
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(tabs).block(Block::default().borders(Borders::ALL).title(" Tables ")),
+        area,
+    );
+}
+
+fn draw_rows(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let widths = column_widths(&app.data, area.width.saturating_sub(3));
+    let header = Row::new(
+        app.data
+            .columns
+            .iter()
+            .map(|value| Cell::from(value.as_str())),
+    )
+    .style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+    let rows = app
+        .data
+        .rows
+        .iter()
+        .map(|row| Row::new(row.iter().map(|value| Cell::from(value.as_str()))));
+    let title = format!(
+        " {} ({} rows{}) ",
+        app.data.name,
+        app.data.rows.len(),
+        if app.data.rows.len() == ROW_LIMIT {
+            ", limited"
+        } else {
+            ""
+        }
+    );
+    let table = Table::new(rows, widths)
+        .header(header)
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ")
+        .block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_stateful_widget(table, area, &mut app.row_state);
+}
+
+fn column_widths(data: &TableData, available: u16) -> Vec<Constraint> {
+    if data.columns.is_empty() {
+        return Vec::new();
+    }
+    let width = (available / data.columns.len() as u16).max(8);
+    data.columns
+        .iter()
+        .map(|_| Constraint::Length(width))
+        .collect()
+}
+
+fn draw_detail(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let text = app
+        .row_state
+        .selected()
+        .and_then(|index| app.data.rows.get(index))
+        .map(|row| {
+            app.data
+                .columns
+                .iter()
+                .zip(row)
+                .map(|(column, value)| {
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{column}: "),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(value),
+                    ])
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![Line::from("No row selected")]);
+    frame.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Selected row "),
+        ),
+        area,
+    );
+}
+
+fn run(database_path: String) -> Result<(), Box<dyn Error>> {
+    let connection = Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut app = App::new(database_path, &connection)?;
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        loop {
+            terminal.draw(|frame| draw(frame, &mut app))?;
+            if !event::poll(Duration::from_millis(250))? {
+                continue;
+            }
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Left | KeyCode::Char('h') => app.select_table(&connection, -1)?,
+                KeyCode::Right | KeyCode::Char('l') => app.select_table(&connection, 1)?,
+                KeyCode::Up | KeyCode::Char('k') => app.select_row(-1),
+                KeyCode::Down | KeyCode::Char('j') => app.select_row(1),
+                KeyCode::PageUp => app.select_row(-10),
+                KeyCode::PageDown => app.select_row(10),
+                KeyCode::Home => app
+                    .row_state
+                    .select((!app.data.rows.is_empty()).then_some(0)),
+                KeyCode::End => app.row_state.select(app.data.rows.len().checked_sub(1)),
+                KeyCode::Char('r') => match app.reload(&connection) {
+                    Ok(()) => {}
+                    Err(error) => app.status = format!("reload failed: {error}"),
+                },
+                _ => {}
+            }
+        }
+        Ok(())
+    })();
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    result
+}
+
+fn main() {
+    let Some(database_path) = env::args().nth(1) else {
+        eprintln!("Usage: sqlite-reader <database.sqlite>");
+        std::process::exit(2);
+    };
+    if let Err(error) = run(database_path) {
+        eprintln!("sqlite-reader: {error}");
+        std::process::exit(1);
+    }
+}
