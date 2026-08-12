@@ -41,6 +41,9 @@ struct App {
     tab_offset: usize,
     data: TableData,
     row_state: TableState,
+    filter: String,
+    filter_draft: String,
+    editing_filter: bool,
     status: String,
 }
 
@@ -53,6 +56,9 @@ impl App {
             tab_offset: 0,
             data: TableData::default(),
             row_state: TableState::default(),
+            filter: String::new(),
+            filter_draft: String::new(),
+            editing_filter: false,
             status: String::new(),
         };
         app.reload(connection)?;
@@ -73,7 +79,7 @@ impl App {
 
     fn load_current_table(&mut self, connection: &Connection) -> rusqlite::Result<()> {
         self.data = match self.tables.get(self.table_index) {
-            Some(name) => load_table(connection, name)?,
+            Some(name) => load_table(connection, name, &self.filter)?,
             None => TableData::default(),
         };
         self.row_state
@@ -104,6 +110,39 @@ impl App {
                 .min(self.data.rows.len() - 1),
         ));
     }
+
+    fn begin_filter_edit(&mut self) {
+        self.filter_draft.clone_from(&self.filter);
+        self.editing_filter = true;
+    }
+
+    fn apply_filter(&mut self, connection: &Connection) -> rusqlite::Result<()> {
+        let previous = self.filter.clone();
+        self.filter = self.filter_draft.trim().to_owned();
+        if let Err(error) = self.load_current_table(connection) {
+            self.filter = previous;
+            return Err(error);
+        }
+        self.editing_filter = false;
+        self.status = if self.filter.is_empty() {
+            "filter cleared".to_owned()
+        } else {
+            format!("filter applied: {}", self.filter)
+        };
+        Ok(())
+    }
+
+    fn clear_filter(&mut self, connection: &Connection) -> rusqlite::Result<()> {
+        if self.filter.is_empty() {
+            self.status = "no filter to clear".to_owned();
+            return Ok(());
+        }
+        self.filter.clear();
+        self.filter_draft.clear();
+        self.load_current_table(connection)?;
+        self.status = "filter cleared".to_owned();
+        Ok(())
+    }
 }
 
 fn quote_identifier(identifier: &str) -> String {
@@ -117,8 +156,13 @@ fn table_names(connection: &Connection) -> rusqlite::Result<Vec<String>> {
     statement.query_map([], |row| row.get(0))?.collect()
 }
 
-fn load_table(connection: &Connection, name: &str) -> rusqlite::Result<TableData> {
-    let sql = format!("SELECT * FROM {} LIMIT {ROW_LIMIT}", quote_identifier(name));
+fn load_table(connection: &Connection, name: &str, filter: &str) -> rusqlite::Result<TableData> {
+    let where_clause = (!filter.is_empty()).then(|| format!(" WHERE {filter}"));
+    let sql = format!(
+        "SELECT * FROM {}{} LIMIT {ROW_LIMIT}",
+        quote_identifier(name),
+        where_clause.unwrap_or_default()
+    );
     let mut statement = connection.prepare(&sql)?;
     let columns = statement
         .column_names()
@@ -163,17 +207,32 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     draw_tabs(frame, app, areas[0]);
     draw_rows(frame, app, areas[1]);
     draw_detail(frame, app, areas[2]);
-    let help = Line::from(vec![
-        Span::styled("←/→", Style::default().fg(Color::Cyan)),
-        Span::raw(" table  "),
-        Span::styled("↑/↓ PgUp/PgDn", Style::default().fg(Color::Cyan)),
-        Span::raw(" row  "),
-        Span::styled("r", Style::default().fg(Color::Cyan)),
-        Span::raw(" reload  "),
-        Span::styled("q", Style::default().fg(Color::Cyan)),
-        Span::raw(" quit  "),
-        Span::styled(&app.status, Style::default().fg(Color::DarkGray)),
-    ]);
+    let help = if app.editing_filter {
+        Line::from(vec![
+            Span::styled("Filter: ", Style::default().fg(Color::Cyan)),
+            Span::raw(&app.filter_draft),
+            Span::styled("  Enter", Style::default().fg(Color::Cyan)),
+            Span::raw(" apply  "),
+            Span::styled("Esc", Style::default().fg(Color::Cyan)),
+            Span::raw(" cancel"),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("←/→", Style::default().fg(Color::Cyan)),
+            Span::raw(" table  "),
+            Span::styled("↑/↓ PgUp/PgDn", Style::default().fg(Color::Cyan)),
+            Span::raw(" row  "),
+            Span::styled("r", Style::default().fg(Color::Cyan)),
+            Span::raw(" reload  "),
+            Span::styled("f", Style::default().fg(Color::Cyan)),
+            Span::raw(" filter  "),
+            Span::styled("c", Style::default().fg(Color::Cyan)),
+            Span::raw(" clear  "),
+            Span::styled("q", Style::default().fg(Color::Cyan)),
+            Span::raw(" quit  "),
+            Span::styled(&app.status, Style::default().fg(Color::DarkGray)),
+        ])
+    };
     frame.render_widget(Paragraph::new(help), areas[3]);
 }
 
@@ -230,7 +289,14 @@ fn draw_tabs(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Line::from(spans)
     };
     frame.render_widget(
-        Paragraph::new(tabs).block(Block::default().borders(Borders::ALL).title(" Tables ")),
+        Paragraph::new(tabs).block(Block::default().borders(Borders::ALL).title(format!(
+            " Tables — filter: {} ",
+            if app.filter.is_empty() {
+                "none"
+            } else {
+                &app.filter
+            }
+        ))),
         area,
     );
 }
@@ -340,6 +406,21 @@ fn run(database_path: String) -> Result<(), Box<dyn Error>> {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            if app.editing_filter {
+                match key.code {
+                    KeyCode::Esc => app.editing_filter = false,
+                    KeyCode::Enter => match app.apply_filter(&connection) {
+                        Ok(()) => {}
+                        Err(error) => app.status = format!("invalid filter: {error}"),
+                    },
+                    KeyCode::Backspace => {
+                        app.filter_draft.pop();
+                    }
+                    KeyCode::Char(character) => app.filter_draft.push(character),
+                    _ => {}
+                }
+                continue;
+            }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Left | KeyCode::Char('h') => app.select_table(&connection, -1)?,
@@ -355,6 +436,11 @@ fn run(database_path: String) -> Result<(), Box<dyn Error>> {
                 KeyCode::Char('r') => match app.reload(&connection) {
                     Ok(()) => {}
                     Err(error) => app.status = format!("reload failed: {error}"),
+                },
+                KeyCode::Char('f') => app.begin_filter_edit(),
+                KeyCode::Char('c') => match app.clear_filter(&connection) {
+                    Ok(()) => {}
+                    Err(error) => app.status = format!("could not clear filter: {error}"),
                 },
                 _ => {}
             }
