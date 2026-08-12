@@ -15,6 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
 };
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
+use unicode_width::UnicodeWidthStr;
 
 const ROW_LIMIT: usize = 1_000;
 
@@ -37,6 +38,7 @@ struct App {
     database_path: String,
     tables: Vec<String>,
     table_index: usize,
+    tab_offset: usize,
     data: TableData,
     row_state: TableState,
     status: String,
@@ -48,6 +50,7 @@ impl App {
             database_path,
             tables: Vec::new(),
             table_index: 0,
+            tab_offset: 0,
             data: TableData::default(),
             row_state: TableState::default(),
             status: String::new(),
@@ -62,6 +65,7 @@ impl App {
         self.table_index = previous
             .and_then(|name| self.tables.iter().position(|table| table == &name))
             .unwrap_or(0);
+        self.tab_offset = self.tab_offset.min(self.table_index);
         self.load_current_table(connection)?;
         self.status = format!("reloaded {}", self.database_path);
         Ok(())
@@ -85,6 +89,7 @@ impl App {
             .table_index
             .saturating_add_signed(delta)
             .min(self.tables.len() - 1);
+        self.tab_offset = self.tab_offset.min(self.table_index);
         self.load_current_table(connection)
     }
 
@@ -172,27 +177,57 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     frame.render_widget(Paragraph::new(help), areas[3]);
 }
 
-fn draw_tabs(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+fn tab_width(name: &str) -> usize {
+    UnicodeWidthStr::width(name) + 2
+}
+
+fn draw_tabs(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let available = usize::from(area.width.saturating_sub(4));
+    while app.tab_offset < app.table_index
+        && app.tables[app.tab_offset..=app.table_index]
+            .iter()
+            .map(|name| tab_width(name))
+            .sum::<usize>()
+            > available
+    {
+        app.tab_offset += 1;
+    }
+
     let tabs = if app.tables.is_empty() {
         Line::from("No user tables")
     } else {
-        Line::from(
-            app.tables
-                .iter()
-                .enumerate()
-                .flat_map(|(index, name)| {
-                    let style = if index == app.table_index {
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::Gray)
-                    };
-                    [Span::raw(" "), Span::styled(name, style), Span::raw(" ")]
-                })
-                .collect::<Vec<_>>(),
-        )
+        let has_previous = app.tab_offset > 0;
+        let prefix_width = usize::from(has_previous) * 2;
+        let mut used = prefix_width;
+        let mut spans = if has_previous {
+            vec![Span::styled("‹ ", Style::default().fg(Color::DarkGray))]
+        } else {
+            Vec::new()
+        };
+        let mut has_next = false;
+        for (index, name) in app.tables.iter().enumerate().skip(app.tab_offset) {
+            let width = tab_width(name);
+            let has_more = index + 1 < app.tables.len();
+            let reserve_for_more = usize::from(has_more) * 2;
+            if used + width + reserve_for_more > available && index != app.table_index {
+                has_next = true;
+                break;
+            }
+            used += width;
+            let style = if index == app.table_index {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            spans.extend([Span::raw(" "), Span::styled(name, style), Span::raw(" ")]);
+        }
+        if has_next {
+            spans.push(Span::styled(" ›", Style::default().fg(Color::DarkGray)));
+        }
+        Line::from(spans)
     };
     frame.render_widget(
         Paragraph::new(tabs).block(Block::default().borders(Borders::ALL).title(" Tables ")),

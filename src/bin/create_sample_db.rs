@@ -60,6 +60,33 @@ fn create_sample_database(path: &PathBuf) -> Result<(), Box<dyn Error>> {
         ",
     )?;
 
+    // Extra tables make it easy to verify horizontal tab scrolling in the TUI.
+    for table in [
+        "activity_logs",
+        "api_keys",
+        "app_settings",
+        "attachments",
+        "categories",
+        "comments",
+        "events",
+        "notifications",
+        "sessions",
+        "tags",
+        "user_preferences",
+        "webhooks",
+    ] {
+        connection.execute(
+            &format!(
+                "CREATE TABLE {table} (id INTEGER PRIMARY KEY, label TEXT NOT NULL, created_at TEXT NOT NULL)"
+            ),
+            [],
+        )?;
+        connection.execute(
+            &format!("INSERT INTO {table} (label, created_at) VALUES (?1, ?2)"),
+            params![format!("Sample {table}"), "2026-08-12T00:00:00Z"],
+        )?;
+    }
+
     let mut insert_user = connection
         .prepare("INSERT INTO users (name, email, active, created_at) VALUES (?1, ?2, ?3, ?4)")?;
     for (name, email, active, created_at) in [
