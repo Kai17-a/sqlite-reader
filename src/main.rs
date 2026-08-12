@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use unicode_width::UnicodeWidthStr;
@@ -44,6 +44,7 @@ struct App {
     filter: String,
     filter_draft: String,
     editing_filter: bool,
+    showing_row_detail: bool,
     status: String,
 }
 
@@ -59,6 +60,7 @@ impl App {
             filter: String::new(),
             filter_draft: String::new(),
             editing_filter: false,
+            showing_row_detail: false,
             status: String::new(),
         };
         app.reload(connection)?;
@@ -207,6 +209,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     draw_tabs(frame, app, areas[0]);
     draw_rows(frame, app, areas[1]);
     draw_detail(frame, app, areas[2]);
+    if app.showing_row_detail {
+        draw_row_modal(frame, app);
+    }
     let help = if app.editing_filter {
         Line::from(vec![
             Span::styled("Filter: ", Style::default().fg(Color::Cyan)),
@@ -222,6 +227,8 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             Span::raw(" table  "),
             Span::styled("↑/↓ PgUp/PgDn", Style::default().fg(Color::Cyan)),
             Span::raw(" row  "),
+            Span::styled("Enter", Style::default().fg(Color::Cyan)),
+            Span::raw(" detail  "),
             Span::styled("r", Style::default().fg(Color::Cyan)),
             Span::raw(" reload  "),
             Span::styled("f", Style::default().fg(Color::Cyan)),
@@ -353,8 +360,20 @@ fn column_widths(data: &TableData, available: u16) -> Vec<Constraint> {
 }
 
 fn draw_detail(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let text = app
-        .row_state
+    frame.render_widget(
+        Paragraph::new(selected_row_lines(app))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Selected row "),
+            ),
+        area,
+    );
+}
+
+fn selected_row_lines(app: &App) -> Vec<Line<'static>> {
+    app.row_state
         .selected()
         .and_then(|index| app.data.rows.get(index))
         .map(|row| {
@@ -370,18 +389,44 @@ fn draw_detail(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::raw(value),
+                        Span::raw(value.clone()),
                     ])
                 })
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_else(|| vec![Line::from("No row selected")]);
+        .unwrap_or_else(|| vec![Line::from("No row selected")])
+}
+
+fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height_percent) / 2),
+            Constraint::Percentage(height_percent),
+            Constraint::Percentage((100 - height_percent) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width_percent) / 2),
+            Constraint::Percentage(width_percent),
+            Constraint::Percentage((100 - width_percent) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn draw_row_modal(frame: &mut ratatui::Frame, app: &App) {
+    let area = centered_rect(frame.area(), 80, 70);
+    frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Selected row "),
-        ),
+        Paragraph::new(selected_row_lines(app))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Row details — Enter/Esc to close "),
+            ),
         area,
     );
 }
@@ -421,6 +466,13 @@ fn run(database_path: String) -> Result<(), Box<dyn Error>> {
                 }
                 continue;
             }
+            if app.showing_row_detail {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Esc => app.showing_row_detail = false,
+                    _ => {}
+                }
+                continue;
+            }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Left | KeyCode::Char('h') => app.select_table(&connection, -1)?,
@@ -438,6 +490,9 @@ fn run(database_path: String) -> Result<(), Box<dyn Error>> {
                     Err(error) => app.status = format!("reload failed: {error}"),
                 },
                 KeyCode::Char('f') => app.begin_filter_edit(),
+                KeyCode::Enter if app.row_state.selected().is_some() => {
+                    app.showing_row_detail = true;
+                }
                 KeyCode::Char('c') => match app.clear_filter(&connection) {
                     Ok(()) => {}
                     Err(error) => app.status = format!("could not clear filter: {error}"),
