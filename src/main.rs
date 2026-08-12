@@ -1,5 +1,6 @@
-use std::{env, error::Error, io, time::Duration};
+use std::{error::Error, io, path::PathBuf, time::Duration};
 
+use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -16,6 +17,14 @@ use ratatui::{
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 
 const ROW_LIMIT: usize = 1_000;
+
+/// Read-only terminal UI for browsing SQLite databases.
+#[derive(Parser)]
+#[command(version, about)]
+struct Args {
+    /// Path to the SQLite database file to open.
+    database: PathBuf,
+}
 
 #[derive(Default)]
 struct TableData {
@@ -324,11 +333,8 @@ fn run(database_path: String) -> Result<(), Box<dyn Error>> {
 }
 
 fn main() {
-    let Some(database_path) = env::args().nth(1) else {
-        eprintln!("Usage: sqlite-reader <database.sqlite>");
-        std::process::exit(2);
-    };
-    if let Err(error) = run(database_path) {
+    let args = Args::parse();
+    if let Err(error) = run(args.database.display().to_string()) {
         eprintln!("sqlite-reader: {error}");
         std::process::exit(1);
     }

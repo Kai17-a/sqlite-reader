@@ -1,14 +1,22 @@
-use std::{env, error::Error, path::Path};
+use std::{error::Error, path::PathBuf};
 
+use clap::Parser;
 use rusqlite::{Connection, params};
 
-fn main() {
-    let path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "sample.sqlite".to_owned());
+/// Create a sample SQLite database for sqlite-reader.
+#[derive(Parser)]
+#[command(version, about)]
+struct Args {
+    /// Destination database path.
+    #[arg(default_value = "sample.sqlite")]
+    database: PathBuf,
+}
 
-    if Path::new(&path).exists() {
-        eprintln!("Refusing to overwrite existing file: {path}");
+fn main() {
+    let path = Args::parse().database;
+
+    if path.exists() {
+        eprintln!("Refusing to overwrite existing file: {}", path.display());
         eprintln!("Choose another path or remove the file first.");
         std::process::exit(2);
     }
@@ -17,10 +25,10 @@ fn main() {
         eprintln!("create-sample-db: {error}");
         std::process::exit(1);
     }
-    println!("Created sample SQLite database: {path}");
+    println!("Created sample SQLite database: {}", path.display());
 }
 
-fn create_sample_database(path: &str) -> Result<(), Box<dyn Error>> {
+fn create_sample_database(path: &PathBuf) -> Result<(), Box<dyn Error>> {
     let connection = Connection::open(path)?;
     connection.execute_batch(
         "
